@@ -1,11 +1,17 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 )
 
@@ -47,7 +53,52 @@ type HttpClient struct {
 	Verbose bool
 }
 
-func (c *HttpClient) Get(inputUrl string) {
+type httpHeaderFlags []string
+
+func (h *httpHeaderFlags) String() string {
+	return fmt.Sprint(*h)
+}
+
+func (h *httpHeaderFlags) Set(value string) error {
+	*h = append(*h, value)
+	return nil
+}
+
+func (c *HttpClient) HandleGetRequest(url string, headers httpHeaderFlags) *http.Response {
+	if c.validateUrl(url) {
+		if c.Verbose {
+			fmt.Println("received url: " + url)
+			fmt.Println("received headers: " + headers.String())
+		}
+		return c.get(url, headers)
+	}
+
+	return nil
+}
+
+func (c *HttpClient) HandlePostRequest(url string, headers httpHeaderFlags, data string, file string) *http.Response {
+	if c.validateUrl(url) {
+		if c.Verbose {
+			fmt.Println("received url: " + url)
+			fmt.Println("received headers: " + headers.String())
+		}
+
+		return c.post(url, headers, data)
+	}
+
+	return nil
+}
+
+func (c *HttpClient) validateUrl(inputUrl string) bool {
+	_, err := url.ParseRequestURI(inputUrl)
+	if err != nil {
+		panic(err)
+	}
+
+	return true
+}
+
+func (c *HttpClient) get(inputUrl string, headers httpHeaderFlags) *http.Response {
 	u, err := url.Parse(inputUrl)
 	if err != nil {
 		panic(err)
@@ -56,7 +107,15 @@ func (c *HttpClient) Get(inputUrl string) {
 	c.checkError(err)
 
 	req := "GET " + inputUrl + " " + c.Proto + "\r\n" +
-		"Host: " + u.Host + "\r\n" + HttpRequestHeaderEnd
+		"Host: " + u.Host + "\r\n"
+	for _, header := range headers {
+		req += header + "\r\n"
+	}
+
+	req += HttpRequestHeaderEnd
+
+	// mock
+	httpReq, _ := http.NewRequest("GET", inputUrl, nil)
 
 	_, err = con.Write([]byte(req))
 	c.checkError(err)
@@ -64,10 +123,30 @@ func (c *HttpClient) Get(inputUrl string) {
 	res, err := ioutil.ReadAll(con)
 	c.checkError(err)
 
-	fmt.Println(string(res))
+	httpRes, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(res)), httpReq)
+	c.checkError(err)
+
+	if httpRes.StatusCode == http.StatusOK {
+		if c.Verbose {
+			fmt.Println(string(res))
+		} else {
+			bodyBytes, err := io.ReadAll(httpRes.Body)
+			if err != nil {
+				log.Fatal(err)
+			}
+			bodyString := string(bodyBytes)
+			fmt.Println(bodyString)
+		}
+
+		return httpRes
+	} else {
+		fmt.Println(string(res))
+	}
+
+	return httpRes
 }
 
-func (c *HttpClient) Post(inputUrl string, data string) {
+func (c *HttpClient) post(inputUrl string, headers httpHeaderFlags, data string) *http.Response {
 	u, err := url.Parse(inputUrl)
 	if err != nil {
 		panic(err)
@@ -76,10 +155,15 @@ func (c *HttpClient) Post(inputUrl string, data string) {
 	c.checkError(err)
 
 	req := "POST " + inputUrl + " " + c.Proto + "\r\n" +
-		"Host: " + u.Host + "\r\n" +
-		"Content-Length: " + strconv.Itoa(len(data)) + "\r\n" +
-		"Content-Type: application/json" + HttpRequestHeaderEnd +
-		data
+		"Host: " + u.Host + "\r\n"
+
+	for _, header := range headers {
+		req += header + "\r\n"
+	}
+	req += "Content-Length: " + strconv.Itoa(len(data)) + HttpRequestHeaderEnd + data
+
+	// mock
+	httpReq, _ := http.NewRequest("POST", inputUrl, nil)
 
 	_, err = con.Write([]byte(req))
 	c.checkError(err)
@@ -87,7 +171,27 @@ func (c *HttpClient) Post(inputUrl string, data string) {
 	res, err := ioutil.ReadAll(con)
 	c.checkError(err)
 
-	fmt.Println(string(res))
+	httpRes, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(res)), httpReq)
+	c.checkError(err)
+
+	if httpRes.StatusCode == http.StatusOK {
+		if c.Verbose {
+			fmt.Println(string(res))
+		} else {
+			bodyBytes, err := io.ReadAll(httpRes.Body)
+			if err != nil {
+				log.Fatal(err)
+			}
+			bodyString := string(bodyBytes)
+			fmt.Println(bodyString)
+		}
+
+		return httpRes
+	} else {
+		fmt.Println(string(res))
+	}
+
+	return httpRes
 }
 
 func (c *HttpClient) checkError(err error) {
@@ -98,35 +202,56 @@ func (c *HttpClient) checkError(err error) {
 }
 
 func main() {
-	client := HttpClient{Proto: "HTTP/1.0"}
 	// client.Get("http://httpbin.org/get?course=networking&assignment=1")
+	// client.Post("http://httpbin.org/post", "{\"Assignment\": 1}")
 
-	client.Post("http://httpbin.org/post", "{\"Assignment\": 1}")
-	// flag.Parse()
+	customSet := flag.NewFlagSet("", flag.ExitOnError)
+	verbose := customSet.Bool("v", false, "verbose mode")
+	data := customSet.String("d", "", "inline data")
+	file := customSet.String("f", "", "file")
 
-	// values := flag.Args()
+	var headers httpHeaderFlags
+	customSet.Var(&headers, "h", "http headers")
 
-	// if len(values) == 0 {
-	// 	fmt.Println(HelpMsg)
-	// 	flag.PrintDefaults()
-	// 	os.Exit(1)
-	// }
+	flag.Parse()
+	customSet.Parse(os.Args[2:]) // skip the fisrt command line argument (get|post)
 
-	// for _, word := range values {
-	// 	if word == "help" {
-	// 		if contains(values, "get") {
-	// 			fmt.Println(HelpGetMsg)
-	// 			os.Exit(1)
-	// 		} else if contains(values, "post") {
-	// 			fmt.Println(HelpPostMsg)
-	// 			os.Exit(1)
-	// 		} else {
-	// 			fmt.Println(HelpMsg)
-	// 			flag.PrintDefaults()
-	// 			os.Exit(1)
-	// 		}
-	// 	}
-	// }
+	commandLineInput := flag.Args()
+	args := customSet.Args()
+
+	client := HttpClient{Proto: "HTTP/1.0", Verbose: *verbose}
+
+	if len(commandLineInput) == 0 {
+		fmt.Println(HelpMsg)
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
+
+	for _, word := range commandLineInput {
+		if word == "help" {
+			if contains(commandLineInput, "get") {
+				fmt.Println(HelpGetMsg)
+				os.Exit(1)
+			} else if contains(commandLineInput, "post") {
+				fmt.Println(HelpPostMsg)
+				os.Exit(1)
+			} else {
+				fmt.Println(HelpMsg)
+				flag.PrintDefaults()
+				os.Exit(1)
+			}
+		}
+
+		if word == "get" {
+			client.HandleGetRequest(args[len(args)-1], headers)
+			os.Exit(1)
+		}
+
+		if word == "post" {
+			client.HandlePostRequest(args[len(args)-1], headers, *data, *file)
+			os.Exit(1)
+		}
+	}
 }
 
 func contains(s []string, e string) bool {
