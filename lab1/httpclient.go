@@ -77,12 +77,19 @@ func (c *HttpClient) HandleGetRequest(url string, headers httpHeaderFlags) *http
 }
 
 func (c *HttpClient) HandlePostRequest(url string, headers httpHeaderFlags, data string, file string) *http.Response {
+	if data != "" && file != "" {
+		log.Fatal("cannot use [-d] and [-f] at same time")
+	}
+
 	if c.validateUrl(url) {
 		if c.Verbose {
 			fmt.Println("received url: " + url)
 			fmt.Println("received headers: " + headers.String())
 		}
 
+		if data == "" && file != "" {
+			data = loadDataFile(file)
+		}
 		return c.post(url, headers, data)
 	}
 
@@ -91,18 +98,15 @@ func (c *HttpClient) HandlePostRequest(url string, headers httpHeaderFlags, data
 
 func (c *HttpClient) validateUrl(inputUrl string) bool {
 	_, err := url.ParseRequestURI(inputUrl)
-	if err != nil {
-		panic(err)
-	}
+	c.checkError(err)
 
 	return true
 }
 
 func (c *HttpClient) get(inputUrl string, headers httpHeaderFlags) *http.Response {
 	u, err := url.Parse(inputUrl)
-	if err != nil {
-		panic(err)
-	}
+	c.checkError(err)
+
 	con, err := net.Dial("tcp", u.Host+":80")
 	c.checkError(err)
 
@@ -148,9 +152,8 @@ func (c *HttpClient) get(inputUrl string, headers httpHeaderFlags) *http.Respons
 
 func (c *HttpClient) post(inputUrl string, headers httpHeaderFlags, data string) *http.Response {
 	u, err := url.Parse(inputUrl)
-	if err != nil {
-		panic(err)
-	}
+	c.checkError(err)
+
 	con, err := net.Dial("tcp", u.Host+":80")
 	c.checkError(err)
 
@@ -195,7 +198,6 @@ func (c *HttpClient) post(inputUrl string, headers httpHeaderFlags, data string)
 }
 
 func (c *HttpClient) checkError(err error) {
-
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -261,4 +263,13 @@ func contains(s []string, e string) bool {
 		}
 	}
 	return false
+}
+
+func loadDataFile(file string) string {
+	content, err := os.ReadFile(file)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return string(content)
 }
