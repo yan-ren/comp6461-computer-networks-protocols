@@ -64,19 +64,19 @@ func (h *httpHeaderFlags) Set(value string) error {
 	return nil
 }
 
-func (c *HttpClient) HandleGetRequest(url string, headers httpHeaderFlags) *http.Response {
+func (c *HttpClient) HandleGetRequest(url string, headers httpHeaderFlags, output string) *http.Response {
 	if c.validateUrl(url) {
 		if c.Verbose {
 			fmt.Println("received url: " + url)
 			fmt.Println("received headers: " + headers.String())
 		}
-		return c.get(url, headers)
+		return c.get(url, headers, output)
 	}
 
 	return nil
 }
 
-func (c *HttpClient) HandlePostRequest(url string, headers httpHeaderFlags, data string, file string) *http.Response {
+func (c *HttpClient) HandlePostRequest(url string, headers httpHeaderFlags, data string, file string, output string) *http.Response {
 	if data != "" && file != "" {
 		log.Fatal("cannot use [-d] and [-f] at same time")
 	}
@@ -90,7 +90,7 @@ func (c *HttpClient) HandlePostRequest(url string, headers httpHeaderFlags, data
 		if data == "" && file != "" {
 			data = loadDataFile(file)
 		}
-		return c.post(url, headers, data)
+		return c.post(url, headers, data, output)
 	}
 
 	return nil
@@ -103,7 +103,7 @@ func (c *HttpClient) validateUrl(inputUrl string) bool {
 	return true
 }
 
-func (c *HttpClient) get(inputUrl string, headers httpHeaderFlags) *http.Response {
+func (c *HttpClient) get(inputUrl string, headers httpHeaderFlags, output string) *http.Response {
 	u, err := url.Parse(inputUrl)
 	c.checkError(err)
 
@@ -139,10 +139,21 @@ func (c *HttpClient) get(inputUrl string, headers httpHeaderFlags) *http.Respons
 				log.Fatal(err)
 			}
 			bodyString := string(bodyBytes)
-			fmt.Println(bodyString)
+			if output != "" {
+				err := os.WriteFile(output, bodyBytes, 0644)
+				c.checkError(err)
+			} else {
+				fmt.Println(bodyString)
+			}
 		}
-
-		return httpRes
+	} else if httpRes.StatusCode == http.StatusMovedPermanently || httpRes.StatusCode == http.StatusFound {
+		redirectUrl := httpRes.Header.Get("Location")
+		if redirectUrl != "" {
+			fmt.Printf("redirect to %s\n", redirectUrl)
+			c.get(redirectUrl, nil, output)
+		} else {
+			fmt.Printf("redirct error: missing Location in header: %s\n", httpRes.Header)
+		}
 	} else {
 		fmt.Println(string(res))
 	}
@@ -150,7 +161,7 @@ func (c *HttpClient) get(inputUrl string, headers httpHeaderFlags) *http.Respons
 	return httpRes
 }
 
-func (c *HttpClient) post(inputUrl string, headers httpHeaderFlags, data string) *http.Response {
+func (c *HttpClient) post(inputUrl string, headers httpHeaderFlags, data string, output string) *http.Response {
 	u, err := url.Parse(inputUrl)
 	c.checkError(err)
 
@@ -186,10 +197,21 @@ func (c *HttpClient) post(inputUrl string, headers httpHeaderFlags, data string)
 				log.Fatal(err)
 			}
 			bodyString := string(bodyBytes)
-			fmt.Println(bodyString)
+			if output != "" {
+				err := os.WriteFile(output, bodyBytes, 0644)
+				c.checkError(err)
+			} else {
+				fmt.Println(bodyString)
+			}
 		}
-
-		return httpRes
+	} else if httpRes.StatusCode == http.StatusMovedPermanently || httpRes.StatusCode == http.StatusFound {
+		redirectUrl := httpRes.Header.Get("Location")
+		if redirectUrl != "" {
+			fmt.Printf("redirect to %s\n", redirectUrl)
+			c.post(redirectUrl, headers, data, output)
+		} else {
+			fmt.Printf("redirct error: missing Location in header: %s\n", httpRes.Header)
+		}
 	} else {
 		fmt.Println(string(res))
 	}
@@ -211,6 +233,7 @@ func main() {
 	verbose := customSet.Bool("v", false, "verbose mode")
 	data := customSet.String("d", "", "inline data")
 	file := customSet.String("f", "", "file")
+	output := customSet.String("o", "", "output file name")
 
 	var headers httpHeaderFlags
 	customSet.Var(&headers, "h", "http headers")
@@ -245,12 +268,12 @@ func main() {
 		}
 
 		if word == "get" {
-			client.HandleGetRequest(args[len(args)-1], headers)
+			client.HandleGetRequest(args[len(args)-1], headers, *output)
 			os.Exit(1)
 		}
 
 		if word == "post" {
-			client.HandlePostRequest(args[len(args)-1], headers, *data, *file)
+			client.HandlePostRequest(args[len(args)-1], headers, *data, *file, *output)
 			os.Exit(1)
 		}
 	}

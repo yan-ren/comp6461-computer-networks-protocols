@@ -32,3 +32,15 @@
 ```
 ./httpc post -h Content-Type:application/json --f ./data_file.json http://httpbin.org/post
 ```
+#### Optional Task
+#### Output response to file
+```
+./httpc get -o hello.txt 'http://httpbin.org/get?course=networking&assignment=1' 
+```
+#### Redirection
+```
+./httpc get 'https://httpbin.org/redirect-to?url=http%3A%2F%2Fhttpbin.org%2Fget%3Fcourse%3Dnetworking%26assignment%3D1'
+```
+```
+./httpc post -h Content-Type:application/json --d '{"Assignment": 1}' 'https://httpbin.org/redirect-to?url=http://httpbin.org/post'
+```
