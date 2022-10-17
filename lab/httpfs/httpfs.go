@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -23,6 +22,10 @@ const ReadTimeoutDuration = 5 * time.Second
 
 type fileListResponse struct {
 	Files []string `json:"files"`
+}
+
+type errorResponse struct {
+	Error error `json:"error"`
 }
 
 func main() {
@@ -49,6 +52,33 @@ func main() {
 	}
 }
 
+func makeResponse(httpCode int, contentType string, body string) []byte {
+	res := fmt.Sprintf("HTTP/1.1 %d %s\r\n", httpCode, http.StatusText(httpCode))
+	res += "Date: " + time.Now().UTC().Format(http.TimeFormat) + "\r\n"
+
+	if body != "" {
+		res += "Content-Type: " + contentType + "\r\n" +
+			"Content-Length: " + fmt.Sprint(len(body)) + HttpRequestHeaderEnd + body
+	} else {
+		res += HttpRequestHeaderEnd
+	}
+
+	return []byte(res)
+}
+
+func sendResponse(conn net.Conn, res []byte) {
+	if _, we := conn.Write(res); we != nil {
+		fmt.Fprintf(os.Stderr, "write error %v\n", we)
+	}
+}
+
+func handleError(conn net.Conn, httpStatusCode int, err error) {
+	fmt.Println(err)
+	b, _ := json.Marshal(errorResponse{Error: err})
+	res := makeResponse(httpStatusCode, "application/json", string(b))
+	sendResponse(conn, res)
+}
+
 func handleGet(conn net.Conn, req *http.Request, verbose bool) {
 	if verbose {
 		fmt.Printf("[debug] handle GET request: %s, path: %s\n", req.URL, req.URL.Path)
@@ -56,47 +86,69 @@ func handleGet(conn net.Conn, req *http.Request, verbose bool) {
 	if req.URL.Path == "" {
 		cwd, err := os.Getwd()
 		if err != nil {
-			fmt.Println(err)
+			handleError(conn, http.StatusInternalServerError, err)
+			return
 		}
 		var respBody fileListResponse
 		respBody.Files = make([]string, 0)
 
 		files, err := ioutil.ReadDir(cwd)
 		if err != nil {
-			fmt.Println(err)
+			handleError(conn, http.StatusInternalServerError, err)
+			return
 		}
+
 		for _, file := range files {
 			if !file.IsDir() {
 				respBody.Files = append(respBody.Files, file.Name())
 			}
 		}
 		b, _ := json.Marshal(respBody)
-
-		// HTTP/1.1 200 OK
-		// Date: Sun, 16 Oct 2022 05:09:56 GMT
-		// Content-Type: application/json
-		// Content-Length: 282
-		res := "HTTP/1.1 200 OK" + "\r\n" +
-			"Date: " + time.Now().UTC().Format(http.TimeFormat) + "\r\n" +
-			"Content-Type: application/json" + "\r\n" +
-			"Content-Length: " + fmt.Sprint(len(string(b))) + HttpRequestHeaderEnd +
-			string(b)
-
-		if _, we := conn.Write([]byte(res)); we != nil {
-			fmt.Fprintf(os.Stderr, "write error %v\n", we)
+		res := makeResponse(http.StatusOK, "application/json", string(b))
+		sendResponse(conn, res)
+	} else {
+		file, err := ioutil.ReadFile(req.URL.Path[1:])
+		if err != nil {
+			if os.IsNotExist(err) {
+				handleError(conn, http.StatusNotFound, err)
+			} else {
+				handleError(conn, http.StatusInternalServerError, err)
+			}
+			return
 		}
+		res := makeResponse(http.StatusOK, "text/plain", string(file))
+		sendResponse(conn, res)
 	}
 }
 
-func handlePost(con net.Conn, req *http.Request, verbose bool) {
-	fmt.Println("post method:")
+func handlePost(conn net.Conn, req *http.Request, verbose bool) {
+	if verbose {
+		fmt.Printf("[debug] handle POST request: %s, path: %s\n", req.URL, req.URL.Path)
+	}
 	b, err := io.ReadAll(req.Body)
-	// b, err := ioutil.ReadAll(resp.Body)  Go.1.15 and earlier
 	if err != nil {
-		log.Fatalln(err)
+		handleError(conn, http.StatusInternalServerError, err)
+		return
 	}
 
-	fmt.Println(string(b))
+	f, err := os.Create(req.URL.Path[1:])
+
+	if err != nil {
+		handleError(conn, http.StatusInternalServerError, err)
+		return
+	}
+
+	defer f.Close()
+
+	_, err = f.Write(b)
+
+	if err != nil {
+		handleError(conn, http.StatusInternalServerError, err)
+		return
+	}
+
+	res := makeResponse(http.StatusCreated, "", "")
+	sendResponse(conn, res)
 }
 
 //echo reads data and sends back what it received until the channel is closed
@@ -146,8 +198,6 @@ func handleConn(conn net.Conn, verbose bool) {
 			return
 		}
 	}
-
-	// fmt.Println(req.Method)
 
 	if request.Method == http.MethodGet {
 		handleGet(conn, request, verbose)

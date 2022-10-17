@@ -44,3 +44,13 @@
 ```
 ./httpc post -h Content-Type:application/json --d '{"Assignment": 1}' 'https://httpbin.org:80/redirect-to?url=http://httpbin.org:80/post'
 ```
+## Lab 2
+```
+./httpc get 'http://127.0.0.1:8007'
+```
+```
+./httpc get 'http://127.0.0.1:8007/foo'
+```
+```
+./httpc post -h Content-Type:application/json --d '{"Assignment": 1}' 'http://127.0.0.1:8007/cool'
+```
