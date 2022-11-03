@@ -20,6 +20,9 @@ const CRLF = "\r\n"
 const HttpRequestHeaderEnd = "\r\n\r\n"
 const ReadTimeoutDuration = 5 * time.Second
 
+var workingDirectory string
+var err error
+
 type fileListResponse struct {
 	Files []string `json:"files"`
 }
@@ -30,9 +33,22 @@ type errorResponse struct {
 
 func main() {
 	verbose := flag.Bool("v", false, "verbose mode")
-	// directory := flag.String("d", "", "specifies the directiory that the server will use to read/write")
+	directory := flag.String("d", "", "specifies the directiory that the server will use to read/write")
 	port := flag.Int("p", 8007, "echo server port")
 	flag.Parse()
+
+	workingDirectory, err = os.Getwd()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to use working directory %s\n", err)
+		return
+	}
+	if *directory != "" {
+		if _, err := os.Stat(workingDirectory + *directory); os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "failed to use working directory %s\n", err)
+			return
+		}
+		workingDirectory += *directory
+	}
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
 	if err != nil {
@@ -41,7 +57,7 @@ func main() {
 	}
 	defer listener.Close()
 
-	fmt.Println("echo server is listening on", listener.Addr())
+	fmt.Println("echo server is listening on", listener.Addr(), " working dir:", *directory)
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -52,13 +68,16 @@ func main() {
 	}
 }
 
-func makeResponse(httpCode int, contentType string, body string) []byte {
+func makeResponse(httpCode int, contentType string, contentDisposition string, body string) []byte {
 	res := fmt.Sprintf("HTTP/1.1 %d %s\r\n", httpCode, http.StatusText(httpCode))
 	res += "Date: " + time.Now().UTC().Format(http.TimeFormat) + "\r\n"
 
 	if body != "" {
-		res += "Content-Type: " + contentType + "\r\n" +
-			"Content-Length: " + fmt.Sprint(len(body)) + HttpRequestHeaderEnd + body
+		res += "Content-Type: " + contentType + "\r\n"
+		if contentDisposition != "" {
+			res += "Content-Disposition: " + contentDisposition + "\r\n"
+		}
+		res += "Content-Length: " + fmt.Sprint(len(body)) + HttpRequestHeaderEnd + body
 	} else {
 		res += HttpRequestHeaderEnd
 	}
@@ -75,7 +94,7 @@ func sendResponse(conn net.Conn, res []byte) {
 func handleError(conn net.Conn, httpStatusCode int, err error) {
 	fmt.Println(err)
 	b, _ := json.Marshal(errorResponse{Error: err})
-	res := makeResponse(httpStatusCode, "application/json", string(b))
+	res := makeResponse(httpStatusCode, "application/json", "", string(b))
 	sendResponse(conn, res)
 }
 
@@ -84,15 +103,10 @@ func handleGet(conn net.Conn, req *http.Request, verbose bool) {
 		fmt.Printf("[debug] handle GET request: %s, path: %s\n", req.URL, req.URL.Path)
 	}
 	if req.URL.Path == "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			handleError(conn, http.StatusInternalServerError, err)
-			return
-		}
 		var respBody fileListResponse
 		respBody.Files = make([]string, 0)
 
-		files, err := ioutil.ReadDir(cwd)
+		files, err := ioutil.ReadDir(workingDirectory)
 		if err != nil {
 			handleError(conn, http.StatusInternalServerError, err)
 			return
@@ -104,10 +118,10 @@ func handleGet(conn net.Conn, req *http.Request, verbose bool) {
 			}
 		}
 		b, _ := json.Marshal(respBody)
-		res := makeResponse(http.StatusOK, "application/json", string(b))
+		res := makeResponse(http.StatusOK, "application/json", "", string(b))
 		sendResponse(conn, res)
 	} else {
-		file, err := ioutil.ReadFile(req.URL.Path[1:])
+		file, err := ioutil.ReadFile(workingDirectory + "/" + req.URL.Path[1:])
 		if err != nil {
 			if os.IsNotExist(err) {
 				handleError(conn, http.StatusNotFound, err)
@@ -116,7 +130,7 @@ func handleGet(conn net.Conn, req *http.Request, verbose bool) {
 			}
 			return
 		}
-		res := makeResponse(http.StatusOK, "text/plain", string(file))
+		res := makeResponse(http.StatusOK, "text/plain", "attachment; filename="+req.URL.Path[1:], string(file))
 		sendResponse(conn, res)
 	}
 }
@@ -131,7 +145,7 @@ func handlePost(conn net.Conn, req *http.Request, verbose bool) {
 		return
 	}
 
-	f, err := os.Create(req.URL.Path[1:])
+	f, err := os.Create(workingDirectory + "/" + req.URL.Path[1:])
 
 	if err != nil {
 		handleError(conn, http.StatusInternalServerError, err)
@@ -147,7 +161,7 @@ func handlePost(conn net.Conn, req *http.Request, verbose bool) {
 		return
 	}
 
-	res := makeResponse(http.StatusCreated, "", "")
+	res := makeResponse(http.StatusCreated, "", "", "")
 	sendResponse(conn, res)
 }
 

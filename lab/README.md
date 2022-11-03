@@ -46,11 +46,11 @@
 ```
 ## Lab 2
 ```
-./httpc get 'http://127.0.0.1:8007'
+./httpc get -v 'http://127.0.0.1:8007'
 ```
 ```
-./httpc get 'http://127.0.0.1:8007/foo'
+./httpc get -v 'http://127.0.0.1:8007/foo'
 ```
 ```
-./httpc post -h Content-Type:application/json --d '{"Assignment": 1}' 'http://127.0.0.1:8007/cool'
+./httpc post -v -h Content-Type:application/json --d '{"Assignment": 100}' 'http://127.0.0.1:8007/cool'
 ```
