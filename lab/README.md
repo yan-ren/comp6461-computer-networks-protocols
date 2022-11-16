@@ -45,12 +45,27 @@
 ./httpc post -h Content-Type:application/json --d '{"Assignment": 1}' 'https://httpbin.org:80/redirect-to?url=http://httpbin.org:80/post'
 ```
 ## Lab 2
+#### Launch file server, default port: 8007
+```
+./httpfs -v
+```
+
+#### Return a list of the current files in the data directory
 ```
 ./httpc get -v 'http://127.0.0.1:8007'
 ```
+
+#### Returns the content of the file named foo
 ```
 ./httpc get -v 'http://127.0.0.1:8007/foo'
 ```
+
+#### Create or overwrite the file named cool in the data directory
 ```
 ./httpc post -v -h Content-Type:application/json --d '{"Assignment": 100}' 'http://127.0.0.1:8007/cool'
+```
+
+#### Write to parent directory of current directory should be error
+```
+./httpc post -v -h Content-Type:application/json --d '{"Assignment": 100}' 'http://127.0.0.1:8007/../cool'
 ```

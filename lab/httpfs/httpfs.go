@@ -6,10 +6,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -28,7 +30,7 @@ type fileListResponse struct {
 }
 
 type errorResponse struct {
-	Error error `json:"error"`
+	Error string `json:"error"`
 }
 
 func main() {
@@ -57,7 +59,7 @@ func main() {
 	}
 	defer listener.Close()
 
-	fmt.Println("echo server is listening on", listener.Addr(), " working dir:", *directory)
+	fmt.Println("file server is listening on", listener.Addr(), " working dir:", *directory)
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -92,8 +94,8 @@ func sendResponse(conn net.Conn, res []byte) {
 }
 
 func handleError(conn net.Conn, httpStatusCode int, err error) {
-	fmt.Println(err)
-	b, _ := json.Marshal(errorResponse{Error: err})
+	fmt.Println("[error]: " + err.Error())
+	b, _ := json.Marshal(errorResponse{Error: err.Error()})
 	res := makeResponse(httpStatusCode, "application/json", "", string(b))
 	sendResponse(conn, res)
 }
@@ -106,17 +108,22 @@ func handleGet(conn net.Conn, req *http.Request, verbose bool) {
 		var respBody fileListResponse
 		respBody.Files = make([]string, 0)
 
-		files, err := ioutil.ReadDir(workingDirectory)
+		err := filepath.WalkDir(workingDirectory,
+			func(path string, info fs.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+				if !info.IsDir() {
+					rel, _ := filepath.Rel(workingDirectory, path)
+					respBody.Files = append(respBody.Files, rel)
+				}
+				return nil
+			})
 		if err != nil {
 			handleError(conn, http.StatusInternalServerError, err)
 			return
 		}
 
-		for _, file := range files {
-			if !file.IsDir() {
-				respBody.Files = append(respBody.Files, file.Name())
-			}
-		}
 		b, _ := json.Marshal(respBody)
 		res := makeResponse(http.StatusOK, "application/json", "", string(b))
 		sendResponse(conn, res)
@@ -145,6 +152,11 @@ func handlePost(conn net.Conn, req *http.Request, verbose bool) {
 		return
 	}
 
+	if !verifyFilePath(req.URL.Path[1:]) {
+		handleError(conn, http.StatusInternalServerError, fmt.Errorf("invalid file path: %s", req.URL.Path[1:]))
+		return
+	}
+
 	f, err := os.Create(workingDirectory + "/" + req.URL.Path[1:])
 
 	if err != nil {
@@ -165,7 +177,15 @@ func handlePost(conn net.Conn, req *http.Request, verbose bool) {
 	sendResponse(conn, res)
 }
 
-//echo reads data and sends back what it received until the channel is closed
+func verifyFilePath(s string) bool {
+	if strings.HasPrefix(s, "..") {
+		return false
+	}
+
+	return true
+}
+
+// echo reads data and sends back what it received until the channel is closed
 func handleConn(conn net.Conn, verbose bool) {
 	defer func() {
 		fmt.Printf("closing connection %v\n", conn.RemoteAddr())
