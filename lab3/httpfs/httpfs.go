@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"io/ioutil"
+	"lab3/lib"
 	"net"
 	"net/http"
 	"os"
@@ -17,10 +18,13 @@ import (
 	"time"
 )
 
-const DefaultBufferSize = 1024
-const CRLF = "\r\n"
-const HttpRequestHeaderEnd = "\r\n\r\n"
-const ReadTimeoutDuration = 5 * time.Second
+const (
+	DefaultBufferSize    = 2048
+	CRLF                 = "\r\n"
+	HttpRequestHeaderEnd = "\r\n\r\n"
+	ReadTimeoutDuration  = 5 * time.Second
+	Host                 = "127.0.0.1"
+)
 
 var workingDirectory string
 var err error
@@ -34,7 +38,8 @@ type errorResponse struct {
 }
 
 func main() {
-	verbose := flag.Bool("v", false, "verbose mode")
+	// parse args
+	// verbose := flag.Bool("v", false, "verbose mode")
 	directory := flag.String("d", "", "specifies the directiory that the server will use to read/write")
 	port := flag.Int("p", 8007, "echo server port")
 	flag.Parse()
@@ -52,22 +57,42 @@ func main() {
 		workingDirectory += *directory
 	}
 
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
+	// udp setup
+	s, err := net.ResolveUDPAddr("udp", Host+":"+fmt.Sprint(*port))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to listen on %d\n", *port)
+		fmt.Println(err)
 		return
 	}
-	defer listener.Close()
 
-	fmt.Println("file server is listening on", listener.Addr(), " working dir:", *directory)
+	connection, err := net.ListenUDP("udp", s)
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	defer connection.Close()
+	buffer := make([]byte, 1024)
+
+	fmt.Println("file server is listening on", s.AddrPort(), " working dir:", *directory)
 	for {
-		conn, err := listener.Accept()
+		n, fromAddr, err := connection.ReadFromUDP(buffer)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error occured during accept connection %v\n", err)
+			fmt.Println("failed to receive message:", err)
+			return
+		}
+
+		p, err := lib.ParsePacket(fromAddr, buffer[:n])
+		if err != nil {
+			fmt.Println("invalid packet:", err)
 			continue
 		}
-		go handleConn(conn, *verbose)
+
+		process(connection, *p)
 	}
+}
+
+func process(conn *net.UDPConn, p lib.Packet) {
+	fmt.Printf("receive packet %s", p)
 }
 
 func makeResponse(httpCode int, contentType string, contentDisposition string, body string) []byte {
@@ -178,14 +203,13 @@ func handlePost(conn net.Conn, req *http.Request, verbose bool) {
 }
 
 func verifyFilePath(s string) bool {
-	if strings.HasPrefix(s, "..") {
+	if strings.Contains(s, "..") {
 		return false
 	}
 
 	return true
 }
 
-// echo reads data and sends back what it received until the channel is closed
 func handleConn(conn net.Conn, verbose bool) {
 	defer func() {
 		fmt.Printf("closing connection %v\n", conn.RemoteAddr())
