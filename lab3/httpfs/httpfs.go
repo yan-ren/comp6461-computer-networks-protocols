@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"io/ioutil"
 	"lab3/lib"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -19,16 +20,27 @@ import (
 )
 
 const (
-	DefaultBufferSize    = 2048
+	BufferSize           = 2048
 	CRLF                 = "\r\n"
 	HttpRequestHeaderEnd = "\r\n\r\n"
 	ReadTimeoutDuration  = 5 * time.Second
 	Host                 = "127.0.0.1"
+	WindowSize           = 1024
+	DefaultTimeOut       = 1 * time.Second
+	Router               = "127.0.0.1:3000"
 )
 
 var workingDirectory string
 var err error
+var handshakeSynChannel = make(chan *lib.Packet, 1)
+var handshakeAckChannel = make(chan *lib.Packet, 1)
 
+type HttpServer struct {
+	ServerConn   *net.UDPConn
+	RouterAddr   *net.UDPAddr
+	ClientAddr   *net.UDPAddr
+	ReciveWindow []lib.WindowElement
+}
 type fileListResponse struct {
 	Files []string `json:"files"`
 }
@@ -57,42 +69,53 @@ func main() {
 		workingDirectory += *directory
 	}
 
-	// udp setup
+	// Initialize http server
+	httpServer := HttpServer{ReciveWindow: make([]lib.WindowElement, WindowSize)}
+
+	// UDP setup
+	// Initialize host url and port
 	s, err := net.ResolveUDPAddr("udp", Host+":"+fmt.Sprint(*port))
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
-
-	connection, err := net.ListenUDP("udp", s)
+	httpServer.ServerConn, err = net.ListenUDP("udp", s)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
+	// Resolve Router address
+	httpServer.RouterAddr, err = net.ResolveUDPAddr("udp", Router)
+	checkError(err)
 
-	defer connection.Close()
-	buffer := make([]byte, 1024)
+	defer httpServer.ServerConn.Close()
+	// buffer := make([]byte, 1024)
 
 	fmt.Println("file server is listening on", s.AddrPort(), " working dir:", *directory)
+	// for {
+	// 	n, fromAddr, err := connection.ReadFromUDP(buffer)
+	// 	if err != nil {
+	// 		fmt.Println("failed to receive message:", err)
+	// 		return
+	// 	}
+
+	// 	p, err := lib.ParsePacket(fromAddr, buffer[:n])
+	// 	if err != nil {
+	// 		fmt.Println("invalid packet:", err)
+	// 		continue
+	// 	}
+
+	// 	process(connection, *p)
+	// }
+	go httpServer.receive()
 	for {
-		n, fromAddr, err := connection.ReadFromUDP(buffer)
-		if err != nil {
-			fmt.Println("failed to receive message:", err)
-			return
-		}
+		httpServer.establish(false)
 
-		p, err := lib.ParsePacket(fromAddr, buffer[:n])
-		if err != nil {
-			fmt.Println("invalid packet:", err)
-			continue
-		}
-
-		process(connection, *p)
 	}
 }
 
 func process(conn *net.UDPConn, p lib.Packet) {
-	fmt.Printf("receive packet %s", p)
+	fmt.Printf("receive packet %s\n", p)
 }
 
 func makeResponse(httpCode int, contentType string, contentDisposition string, body string) []byte {
@@ -218,7 +241,7 @@ func handleConn(conn net.Conn, verbose bool) {
 
 	fmt.Printf("new connection from %v\n", conn.RemoteAddr())
 
-	buf := make([]byte, DefaultBufferSize)
+	buf := make([]byte, BufferSize)
 	tmp := ""
 	var request *http.Request
 
@@ -263,5 +286,59 @@ func handleConn(conn net.Conn, verbose bool) {
 
 	if request.Method == http.MethodPost {
 		handlePost(conn, request, verbose)
+	}
+}
+
+func (s *HttpServer) receive() {
+	buffer := make([]byte, BufferSize)
+
+	for {
+		n, _, err := s.ServerConn.ReadFromUDP(buffer)
+		checkError(err)
+		p, err := lib.ParsePacket(buffer[:n])
+		checkError(err)
+		// Response to handshake
+		if p.Type == lib.SYN && len(handshakeSynChannel) == 0 {
+			handshakeSynChannel <- p
+		}
+		if p.Type == lib.ACK {
+			handshakeAckChannel <- p
+		}
+		// DATA
+		if p.Type == lib.DATA && s.ReciveWindow[p.SeqNum].Packet != nil {
+			s.ReciveWindow[p.SeqNum].Packet = p
+		}
+	}
+}
+
+/*
+Establish tcp three-way handshaking
+*/
+func (s *HttpServer) establish(syn bool) {
+	// Listen on SYN
+	if !syn {
+		packet := <-handshakeSynChannel
+		fmt.Printf("[handshake] syn from %s\n", packet.FromAddr)
+		if s.ClientAddr == nil {
+			s.ClientAddr = packet.FromAddr
+		}
+	}
+	// Send SYN-ACK
+	_, err = s.ServerConn.WriteToUDP(lib.Packet{Type: lib.SYNACK, SeqNum: 0, ToAddr: s.ClientAddr}.Raw(), s.RouterAddr)
+	checkError(err)
+	// Listen on channel and a timeout channel
+	select {
+	case res := <-handshakeAckChannel:
+		fmt.Printf("[handshake] ack from %s\n", res.FromAddr)
+	case <-time.After(DefaultTimeOut):
+		fmt.Println("[handshake] ack time out, resent syn-ack")
+		s.establish(true)
+		return
+	}
+}
+
+func checkError(err error) {
+	if err != nil {
+		log.Fatal(err)
 	}
 }

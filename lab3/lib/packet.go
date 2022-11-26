@@ -12,6 +12,14 @@ const (
 	maxLen = 1024
 )
 
+const (
+	DATA   = 0
+	SYN    = 1
+	ACK    = 2
+	SYNACK = 3
+	FIN    = 4
+)
+
 // Packet represents a simulated network packet.
 type Packet struct {
 	// Type is the type of the packet which is either ACK or DATA (1 byte).
@@ -50,7 +58,8 @@ func (p Packet) String() string {
 }
 
 // ParsePacket extracts, validates and creates a packet from a slice of bytes.
-func ParsePacket(fromAddr *net.UDPAddr, data []byte) (*Packet, error) {
+func ParsePacket(data []byte) (*Packet, error) {
+	var err error
 	if len(data) < minLen {
 		return nil, fmt.Errorf("packet is too short: %d bytes", len(data))
 	}
@@ -67,13 +76,14 @@ func ParsePacket(fromAddr *net.UDPAddr, data []byte) (*Packet, error) {
 	p := Packet{}
 	p.Type = next(1)[0]
 	p.SeqNum = u32(next(4))
-	p.FromAddr = fromAddr
-	toAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", net.IP(next(4)), u16(next(2))))
+	p.FromAddr, err = net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", net.IP(next(4)), u16(next(2))))
+
+	// toAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", net.IP(next(4)), u16(next(2))))
 	// If toAddr is loopback, it should be as same as the host of fromAddr.
-	if toAddr.IP.IsLoopback() {
-		toAddr.IP = fromAddr.IP
-	}
-	p.ToAddr = toAddr
+	// if toAddr.IP.IsLoopback() {
+	// 	toAddr.IP = fromAddr.IP
+	// }
+	// p.ToAddr = toAddr
 	p.Payload = data[curr:]
 	return &p, err
 }
