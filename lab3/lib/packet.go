@@ -8,16 +8,18 @@ import (
 )
 
 const (
-	minLen = 11
-	maxLen = 1024
+	minLen     = 11
+	maxLen     = 1024
+	MaxPayload = maxLen - minLen
 )
 
 const (
-	DATA   = 0
-	SYN    = 1
-	ACK    = 2
-	SYNACK = 3
-	FIN    = 4
+	DATA    uint8 = 0
+	SYN     uint8 = 1
+	ACK     uint8 = 2
+	SYNACK  uint8 = 3
+	FIN     uint8 = 4
+	DELIVER uint8 = 5
 )
 
 // Packet represents a simulated network packet.
