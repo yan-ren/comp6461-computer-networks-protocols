@@ -44,8 +44,8 @@ type HttpServer struct {
 	routerAddr *net.UDPAddr
 	clientAddr *net.UDPAddr
 
-	reciverWindow []*lib.Packet
-	senderWindow  []*lib.WindowElement
+	receiverWindow []*lib.Packet
+	senderWindow   []*lib.WindowElement
 
 	deliveryMessage chan bool
 	logger          *log.Logger
@@ -53,9 +53,16 @@ type HttpServer struct {
 }
 
 func initHttpServer() *HttpServer {
-	httpServer := &HttpServer{reciverWindow: make([]*lib.Packet, WindowSize), senderWindow: make([]*lib.WindowElement, WindowSize), connect: false, mutex: &sync.Mutex{}}
-	httpServer.deliveryMessage = make(chan bool, 1)
-	logf, err := os.OpenFile("server.log."+fmt.Sprint(time.Now().Unix()), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0660)
+	httpServer := &HttpServer{
+		seqNum:          0,
+		connect:         false,
+		receiverWindow:  make([]*lib.Packet, WindowSize),
+		senderWindow:    make([]*lib.WindowElement, WindowSize),
+		deliveryMessage: make(chan bool, 1),
+		mutex:           &sync.Mutex{},
+	}
+
+	logf, err := os.OpenFile("httpfs.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0660)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to open log file: %v", err)
 		panic(err)
@@ -65,15 +72,94 @@ func initHttpServer() *HttpServer {
 	return httpServer
 }
 
-func (s *HttpServer) reset() {
-	s.clientAddr = nil
-	s.reciverWindow = make([]*lib.Packet, WindowSize)
-	s.seqNum = 0
-	s.senderWindow = make([]*lib.WindowElement, WindowSize)
-	s.deliveryMessage = make(chan bool, 1)
-	handshakeSynChannel = make(chan *lib.Packet, 1)
-	handshakeAckChannel = make(chan *lib.Packet, 1)
-	go s.checkForDeliver()
+func (s *HttpServer) connected() {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.connect = true
+}
+
+func (s *HttpServer) disconnected() {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.connect = false
+}
+
+// checkForDeliver writes to readyToDeliver channel when packets in receiver window is ready to be delivered
+func (s *HttpServer) checkForDeliver() {
+	deliverSeqNum := -1
+
+	for {
+		if deliverSeqNum == -1 {
+			for i := 0; i < len(s.receiverWindow); i++ {
+				if s.receiverWindow[i] != nil && s.receiverWindow[i].Type == lib.DELIVER {
+					deliverSeqNum = i
+					break
+				}
+			}
+		} else {
+			readyToDeliver := true
+			for i := deliverSeqNum; i > 0; i-- {
+				if s.receiverWindow[i] == nil {
+					readyToDeliver = false
+				}
+			}
+
+			if readyToDeliver {
+				s.deliveryMessage <- true
+				return
+			}
+		}
+	}
+}
+
+// establishConnection listens to syn and establish tcp three-way handshaking
+func (s *HttpServer) establishConnection() {
+	// Listen on SYN
+	packet := <-handshakeSynChannel
+	s.logger.Printf("[handshake] syn from %s\n", packet.FromAddr)
+	if s.clientAddr == nil {
+		s.clientAddr = packet.FromAddr
+	}
+
+	for {
+		// Send SYN-ACK
+		_, err = s.serverConn.WriteToUDP(lib.Packet{Type: lib.SYNACK, SeqNum: s.seqNum, ToAddr: s.clientAddr}.Raw(), s.routerAddr)
+		if err != nil {
+			s.logger.Println(err)
+		}
+		// Listen on channel and a timeout channel
+		select {
+		case res := <-handshakeAckChannel:
+			s.logger.Printf("[handshake] ack from %s, connection established\n", res.FromAddr)
+			s.seqNum++
+			s.connected()
+			return
+		case <-time.After(DefaultTimeOut):
+			s.logger.Println("[handshake] ack time out, resent syn-ack")
+		}
+	}
+}
+
+// getPackets concates all packets' payload in receiver window and return as []byte
+func (s *HttpServer) getPackets() []byte {
+	payload := []byte{}
+
+	for i := 1; i < len(s.receiverWindow); i++ {
+		if s.receiverWindow[i].Type == lib.DATA {
+			payload = append(payload, s.receiverWindow[i].Payload...)
+		}
+		if s.receiverWindow[i].Type == lib.DELIVER {
+			break
+		}
+	}
+
+	return payload
+}
+
+func (s *HttpServer) isConnected() bool {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	return s.connect
 }
 
 // receive function receives all incomming packets
@@ -100,46 +186,36 @@ func (s *HttpServer) receive() {
 				handshakeAckChannel <- p
 			}
 		}
-		// DATA
+		// ACK
+		if p.Type == lib.ACK && p.SeqNum != 0 {
+			if len(s.senderWindow[p.SeqNum].Ack) == 0 {
+				s.senderWindow[p.SeqNum].Timer.Stop()
+				s.senderWindow[p.SeqNum].Ack <- p
+				s.logger.Printf("[receive] ack from %s, packet %s\n", p.FromAddr, p)
+			}
+		}
+		// DATA, DELIVER
 		if p.Type == lib.DATA || p.Type == lib.DELIVER {
 			// send ACK
 			s.serverConn.WriteToUDP(lib.Packet{Type: lib.ACK, SeqNum: p.SeqNum, ToAddr: p.FromAddr}.Raw(), s.routerAddr)
-			s.forward(p)
+			s.logger.Printf("[receive] ack to %s, packet: %s\n", p.FromAddr, p)
+			// save packet in receiver window
+			if s.receiverWindow[p.SeqNum] == nil {
+				s.receiverWindow[p.SeqNum] = p
+			}
 		}
 	}
 }
 
-func (s *HttpServer) forward(packet *lib.Packet) {
-	if s.reciverWindow[packet.SeqNum] == nil {
-		s.reciverWindow[packet.SeqNum] = packet
-	}
-}
-
-func (s *HttpServer) checkForDeliver() {
-	deliverSeqNum := -1
-
-	for {
-		if deliverSeqNum == -1 {
-			for i := 0; i < len(s.reciverWindow); i++ {
-				if s.reciverWindow[i] != nil && s.reciverWindow[i].Type == lib.DELIVER {
-					deliverSeqNum = i
-					break
-				}
-			}
-		} else {
-			readyToDeliver := true
-			for i := deliverSeqNum; i > 0; i-- {
-				if s.reciverWindow[i] == nil {
-					readyToDeliver = false
-				}
-			}
-
-			if readyToDeliver {
-				s.deliveryMessage <- true
-				return
-			}
-		}
-	}
+func (s *HttpServer) reset() {
+	s.seqNum = 0
+	s.clientAddr = nil
+	s.senderWindow = make([]*lib.WindowElement, WindowSize)
+	s.receiverWindow = make([]*lib.Packet, WindowSize)
+	s.deliveryMessage = make(chan bool, 1)
+	handshakeSynChannel = make(chan *lib.Packet, 1)
+	handshakeAckChannel = make(chan *lib.Packet, 1)
+	go s.checkForDeliver()
 }
 
 // retransmission iterate through sender window and check for timeout
@@ -162,26 +238,34 @@ func (s *HttpServer) retransmission() {
 	}
 }
 
-func (s *HttpServer) send(req []byte) (*http.Response, []byte) {
-	// // send req in packets
-	// startByte := 0
-	// for startByte < len(req) {
-	// 	var payload []byte
-	// 	if startByte+lib.MaxPayload >= len(req) {
-	// 		payload = req[startByte:]
-	// 	} else {
-	// 		payload = req[startByte : startByte+lib.MaxPayload]
-	// 	}
-	// 	startByte += lib.MaxPayload
-	// 	packet := lib.Packet{Type: lib.DATA, SeqNum: c.seqNum, ToAddr: c.serverAddr, Payload: payload}
-	// 	c.sendPacket(&packet)
-	// }
+// send synchronous for req as packets and block until all packets being acknowledged
+func (s *HttpServer) send(req []byte) {
+	// send req as packets
+	startByte := 0
+	for startByte < len(req) {
+		var payload []byte
+		if startByte+lib.MaxPayload >= len(req) {
+			payload = req[startByte:]
+		} else {
+			payload = req[startByte : startByte+lib.MaxPayload]
+		}
+		startByte += lib.MaxPayload
+		packet := lib.Packet{Type: lib.DATA, SeqNum: s.seqNum, ToAddr: s.clientAddr, Payload: payload}
+		s.sendPacket(&packet)
+	}
+	// send delivery notice
+	s.sendPacket(&lib.Packet{Type: lib.DELIVER, SeqNum: s.seqNum, ToAddr: s.clientAddr})
 
-	// // wait for response and parse
-	// for {
-
-	// }
-	return nil, nil
+	// block until all packets have ack
+	blocked := true
+	for blocked {
+		blocked = false
+		for i := 0; i < int(s.seqNum); i++ {
+			if s.senderWindow[i] != nil && s.senderWindow[i].Packet != nil && len(s.senderWindow[i].Ack) == 0 {
+				blocked = true
+			}
+		}
+	}
 }
 
 // sendPacket create new element in sender window and send packet
@@ -193,69 +277,6 @@ func (s *HttpServer) sendPacket(packet *lib.Packet) {
 
 	s.senderWindow[s.seqNum] = lib.NewWindowElement(packet, DefaultTimeOut)
 	s.seqNum++
-}
-
-// concate all packet payload in recever window and return as []byte
-func (s *HttpServer) getPackets() []byte {
-	payload := []byte{}
-
-	for i := 1; i < len(s.reciverWindow); i++ {
-		if s.reciverWindow[i].Type == lib.DATA {
-			payload = append(payload, s.reciverWindow[i].Payload...)
-		}
-		if s.reciverWindow[i].Type == lib.DELIVER {
-			break
-		}
-	}
-
-	return payload
-}
-
-/*
-Establish tcp three-way handshaking
-*/
-func (s *HttpServer) establishConnection() {
-	// Listen on SYN
-	packet := <-handshakeSynChannel
-	s.logger.Printf("[handshake] syn from %s\n", packet.FromAddr)
-	if s.clientAddr == nil {
-		s.clientAddr = packet.FromAddr
-	}
-
-	for {
-		// Send SYN-ACK
-		_, err = s.serverConn.WriteToUDP(lib.Packet{Type: lib.SYNACK, SeqNum: s.seqNum, ToAddr: s.clientAddr}.Raw(), s.routerAddr)
-		if err != nil {
-			s.logger.Println(err)
-		}
-		// Listen on channel and a timeout channel
-		select {
-		case res := <-handshakeAckChannel:
-			s.logger.Printf("[handshake] ack from %s, connection established\n", res.FromAddr)
-			s.connected()
-			return
-		case <-time.After(DefaultTimeOut):
-			s.logger.Println("[handshake] ack time out, resent syn-ack")
-		}
-	}
-}
-
-func (s *HttpServer) isConnected() bool {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	return s.connect
-}
-
-func (s *HttpServer) connected() {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	s.connect = true
-}
-
-func (s *HttpServer) disconnected() {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-	s.connect = false
 }
 
 type fileListResponse struct {
@@ -283,8 +304,8 @@ func makeResponse(httpCode int, contentType string, contentDisposition string, b
 	return []byte(res)
 }
 
-func getErrorResponse(httpStatusCode int, err error) []byte {
-	fmt.Println("[error]: " + err.Error())
+func packetErrorReponse(httpStatusCode int, err error) []byte {
+	fmt.Println("[packetErrorReponse]: " + err.Error())
 	b, _ := json.Marshal(errorResponse{Error: err.Error()})
 	res := makeResponse(httpStatusCode, "application/json", "", string(b))
 	return res
@@ -292,7 +313,7 @@ func getErrorResponse(httpStatusCode int, err error) []byte {
 
 func handleGet(req *http.Request, verbose bool) ([]byte, error) {
 	if verbose {
-		fmt.Printf("[debug] handle GET request: %s, path: %s\n", req.URL, req.URL.Path)
+		fmt.Printf("[handleGet] handle GET request: %s, path: %s\n", req.URL, req.URL.Path)
 	}
 	if req.URL.Path == "" {
 		var respBody fileListResponse
@@ -310,7 +331,7 @@ func handleGet(req *http.Request, verbose bool) ([]byte, error) {
 				return nil
 			})
 		if err != nil {
-			return getErrorResponse(http.StatusInternalServerError, err), err
+			return packetErrorReponse(http.StatusInternalServerError, err), err
 		}
 
 		b, _ := json.Marshal(respBody)
@@ -320,9 +341,9 @@ func handleGet(req *http.Request, verbose bool) ([]byte, error) {
 		file, err := ioutil.ReadFile(workingDirectory + "/" + req.URL.Path[1:])
 		if err != nil {
 			if os.IsNotExist(err) {
-				return getErrorResponse(http.StatusNotFound, err), err
+				return packetErrorReponse(http.StatusNotFound, err), err
 			}
-			return getErrorResponse(http.StatusInternalServerError, err), err
+			return packetErrorReponse(http.StatusInternalServerError, err), err
 		}
 		res := makeResponse(http.StatusOK, "text/plain", "attachment; filename="+req.URL.Path[1:], string(file))
 		return res, nil
@@ -331,21 +352,21 @@ func handleGet(req *http.Request, verbose bool) ([]byte, error) {
 
 func handlePost(req *http.Request, verbose bool) ([]byte, error) {
 	if verbose {
-		fmt.Printf("[debug] handle POST request: %s, path: %s\n", req.URL, req.URL.Path)
+		fmt.Printf("[handlePost] handle POST request: %s, path: %s\n", req.URL, req.URL.Path)
 	}
 	b, err := io.ReadAll(req.Body)
 	if err != nil {
-		return getErrorResponse(http.StatusInternalServerError, err), err
+		return packetErrorReponse(http.StatusInternalServerError, err), err
 	}
 
 	if !verifyFilePath(req.URL.Path[1:]) {
-		return getErrorResponse(http.StatusInternalServerError, fmt.Errorf("invalid file path: %s", req.URL.Path[1:])), err
+		return packetErrorReponse(http.StatusInternalServerError, fmt.Errorf("invalid file path: %s", req.URL.Path[1:])), err
 	}
 
 	f, err := os.Create(workingDirectory + "/" + req.URL.Path[1:])
 
 	if err != nil {
-		return getErrorResponse(http.StatusInternalServerError, err), err
+		return packetErrorReponse(http.StatusInternalServerError, err), err
 	}
 
 	defer f.Close()
@@ -353,7 +374,7 @@ func handlePost(req *http.Request, verbose bool) ([]byte, error) {
 	_, err = f.Write(b)
 
 	if err != nil {
-		return getErrorResponse(http.StatusInternalServerError, err), err
+		return packetErrorReponse(http.StatusInternalServerError, err), err
 	}
 
 	res := makeResponse(http.StatusCreated, "", "", "")
@@ -458,7 +479,7 @@ func main() {
 	// Start receiving packets
 	go httpServer.receive()
 
-	// Start retransmission routinue
+	// Start retransmission routine
 	go httpServer.retransmission()
 
 	// Start delivery checking
@@ -470,18 +491,19 @@ func main() {
 		// receive request
 		<-httpServer.deliveryMessage
 		request := httpServer.getPackets()
-		httpServer.logger.Printf("[debug] receive request:\n%s", string(request))
-
+		if *verbose {
+			httpServer.logger.Printf("[main] receive request:\n%s", string(request))
+		}
 		// prepare response
 		response, err := handleRequest(request, *verbose)
 		if err != nil {
 			httpServer.logger.Println(err)
 		}
-		httpServer.logger.Printf("[debug] send response:\n%s", string(response))
+		if *verbose {
+			httpServer.logger.Printf("[main] send response:\n%s", string(response))
+		}
 		// send response
-
-		// httpServer.send(response)
-		// fmt.Println(string(response))
+		httpServer.send(response)
 
 		// close connection
 		httpServer.disconnected()

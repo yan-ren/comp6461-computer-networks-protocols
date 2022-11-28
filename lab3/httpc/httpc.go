@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"flag"
 	"fmt"
 	"io"
@@ -15,14 +17,14 @@ import (
 )
 
 const HelpMsg = `
-httpc help 
-httpc is a curl-like application but supports HTTP protocol only. 
-Usage: 
-	httpc command [arguments] 
-The commands are: 
-	get     executes a HTTP GET request and prints the response. 
-	post	executes a HTTP POST request and prints the response.   
-	help	prints this screen. 
+httpc help
+httpc is a curl-like application but supports HTTP protocol only.
+Usage:
+	httpc command [arguments]
+The commands are:
+	get     executes a HTTP GET request and prints the response.
+	post	executes a HTTP POST request and prints the response.
+	help	prints this screen.
 Use "httpc help [command]" for more information about a command.`
 
 const HelpGetMsg = `
@@ -48,11 +50,11 @@ Post executes a HTTP POST request for a given URL with inline data or from file.
 const HttpRequestHeaderEnd = "\r\n\r\n"
 
 const (
-	DefaultTimeOut   = 1 * time.Second
-	UDPBufferSize    = 2048
-	SenderWindowSize = 1024
-	Router           = "127.0.0.1:3000"
-	Client           = "127.0.0.1:55341"
+	DefaultTimeOut = 1 * time.Second
+	UDPBufferSize  = 2048
+	WindowSize     = 1024
+	Router         = "127.0.0.1:3000"
+	Client         = "127.0.0.1:55341"
 )
 
 var handshakeSYNACKChannel = make(chan *lib.Packet, 1)
@@ -76,16 +78,23 @@ type HttpClient struct {
 	routerAddr *net.UDPAddr
 	serverAddr *net.UDPAddr
 
-	senderWindow []*lib.WindowElement
+	receiverWindow []*lib.Packet
+	senderWindow   []*lib.WindowElement
 
 	deliveryMessage chan bool
 	logger          *log.Logger
 }
 
 func initHttpClient(verbose bool) *HttpClient {
-	httpClient := &HttpClient{proto: "HTTP/1.0", verbose: verbose, seqNum: 0, senderWindow: make([]*lib.WindowElement, SenderWindowSize)}
-	httpClient.deliveryMessage = make(chan bool, 1)
-	logf, err := os.OpenFile("client.log."+fmt.Sprint(time.Now().Unix()), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0660)
+	httpClient := &HttpClient{
+		proto:           "HTTP/1.0",
+		verbose:         verbose,
+		seqNum:          0,
+		receiverWindow:  make([]*lib.Packet, WindowSize),
+		senderWindow:    make([]*lib.WindowElement, WindowSize),
+		deliveryMessage: make(chan bool, 1),
+	}
+	logf, err := os.OpenFile("httpc.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0660)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to open log file: %v", err)
 		panic(err)
@@ -95,50 +104,35 @@ func initHttpClient(verbose bool) *HttpClient {
 	return httpClient
 }
 
-func (c *HttpClient) HandleGetRequest(url string, headers httpHeaderFlags, output string) *http.Response {
-	if c.validateUrl(url) {
-		if c.verbose {
-			fmt.Println("received url: " + url)
-			fmt.Println("received headers: " + headers.String())
-		}
-		return c.get(url, headers, output)
-	}
+// checkForDeliver writes to readyToDeliver channel when packets in receiver window is ready to be delivered
+func (c *HttpClient) checkForDeliver() {
+	deliverSeqNum := -1
 
-	return nil
+	for {
+		if deliverSeqNum == -1 {
+			for i := 0; i < len(c.receiverWindow); i++ {
+				if c.receiverWindow[i] != nil && c.receiverWindow[i].Type == lib.DELIVER {
+					deliverSeqNum = i
+					break
+				}
+			}
+		} else {
+			readyToDeliver := true
+			for i := deliverSeqNum; i > 0; i-- {
+				if c.receiverWindow[i] == nil {
+					readyToDeliver = false
+				}
+			}
+
+			if readyToDeliver {
+				c.deliveryMessage <- true
+				return
+			}
+		}
+	}
 }
 
-func (c *HttpClient) HandlePostRequest(url string, headers httpHeaderFlags, data string, file string, output string) *http.Response {
-	if data != "" && file != "" {
-		log.Fatal("cannot use [-d] and [-f] at same time")
-	}
-
-	if c.validateUrl(url) {
-		if c.verbose {
-			fmt.Println("received url: " + url)
-			fmt.Println("received headers: " + headers.String())
-		}
-
-		if data == "" && file != "" {
-			data = loadDataFile(file)
-		}
-		return c.post(url, headers, data, output)
-	}
-
-	return nil
-}
-
-func (c *HttpClient) validateUrl(inputUrl string) bool {
-	_, err := url.ParseRequestURI(inputUrl)
-	if err != nil {
-		c.logger.Fatalf("[validateUrl][error] %s\n", err)
-	}
-
-	return true
-}
-
-/*
-Establish tcp three-way handshaking
-*/
+// establishConnection send syn to establish tcp three-way handshaking
 func (c *HttpClient) establishConnection() {
 	for {
 		// Send SYN
@@ -156,6 +150,113 @@ func (c *HttpClient) establishConnection() {
 			return
 		case <-time.After(DefaultTimeOut):
 			c.logger.Println("[handshake] syn time out, resent syn")
+		}
+	}
+}
+
+func (c *HttpClient) get(inputUrl string, headers httpHeaderFlags) (*http.Response, []byte, error) {
+	u, err := url.Parse(inputUrl)
+	if err != nil {
+		c.logger.Fatalf("[get][error] %s\n", err)
+	}
+	// make http GET request
+	req := "GET " + inputUrl + " " + c.proto + "\r\n" +
+		"Host: " + u.Host + "\r\n"
+	for _, header := range headers {
+		req += header + "\r\n"
+	}
+	req += HttpRequestHeaderEnd
+	// mock http request object
+	httpReq, _ := http.NewRequest("GET", inputUrl, nil)
+	// send
+	rawRes := c.send(u, []byte(req))
+	httpRes, err := c.paresHttpResponse(rawRes, httpReq)
+
+	return httpRes, rawRes, err
+}
+
+// getPackets concates all packets' payload in receiver window and return as []byte
+func (c *HttpClient) getPackets() []byte {
+	payload := []byte{}
+
+	for i := 1; i < len(c.receiverWindow); i++ {
+		if c.receiverWindow[i].Type == lib.DATA {
+			payload = append(payload, c.receiverWindow[i].Payload...)
+		}
+		if c.receiverWindow[i].Type == lib.DELIVER {
+			break
+		}
+	}
+
+	return payload
+}
+
+// paresHttpResponse parses http response from raw bytes
+func (c *HttpClient) paresHttpResponse(rawRes []byte, httpReq *http.Request) (*http.Response, error) {
+	httpRes, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(rawRes)), httpReq)
+	return httpRes, err
+}
+
+func (c *HttpClient) post(inputUrl string, headers httpHeaderFlags, data string) (*http.Response, []byte, error) {
+	u, err := url.Parse(inputUrl)
+	if err != nil {
+		c.logger.Fatalf("[post][error] %s\n", err)
+	}
+
+	req := "POST " + inputUrl + " " + c.proto + "\r\n" +
+		"Host: " + u.Host + "\r\n"
+
+	for _, header := range headers {
+		req += header + "\r\n"
+	}
+	req += "Content-Length: " + strconv.Itoa(len(data)) + HttpRequestHeaderEnd + data
+	// mock http request object
+	mockHttpReq, _ := http.NewRequest("GET", inputUrl, nil)
+	// send
+	rawRes := c.send(u, []byte(req))
+	httpRes, err := c.paresHttpResponse(rawRes, mockHttpReq)
+
+	return httpRes, rawRes, err
+}
+
+// receive function receives all incomming packets
+func (c *HttpClient) receive() {
+	buffer := make([]byte, UDPBufferSize)
+
+	for {
+		n, _, err := c.clientConn.ReadFromUDP(buffer)
+		if err != nil {
+			c.logger.Println(err)
+		}
+		p, err := lib.ParsePacket(buffer[:n])
+		if err != nil {
+			c.logger.Println(err)
+		}
+		// Response to handshake
+		if p.Type == lib.SYNACK {
+			c.clientConn.WriteToUDP(lib.Packet{Type: lib.ACK, SeqNum: p.SeqNum, ToAddr: c.serverAddr}.Raw(), c.routerAddr)
+			c.logger.Printf("[receive][handshake] ack to %s, packet %s\n", p.FromAddr, p)
+			if len(handshakeSYNACKChannel) == 0 {
+				handshakeSYNACKChannel <- p
+			}
+		}
+		// ACK
+		if p.Type == lib.ACK {
+			if len(c.senderWindow[p.SeqNum].Ack) == 0 {
+				c.senderWindow[p.SeqNum].Timer.Stop()
+				c.senderWindow[p.SeqNum].Ack <- p
+				c.logger.Printf("[receive] ack from %s, packet %s\n", p.FromAddr, p)
+			}
+		}
+		// DATA, DELIVER
+		if p.Type == lib.DATA || p.Type == lib.DELIVER {
+			// send ACK
+			c.clientConn.WriteToUDP(lib.Packet{Type: lib.ACK, SeqNum: p.SeqNum, ToAddr: p.FromAddr}.Raw(), c.routerAddr)
+			c.logger.Printf("[receive] ack to %s, packet %s\n", p.FromAddr, p)
+			// save packet in receiver window
+			if c.receiverWindow[p.SeqNum] == nil {
+				c.receiverWindow[p.SeqNum] = p
+			}
 		}
 	}
 }
@@ -178,43 +279,9 @@ func (c *HttpClient) retransmission() {
 	}
 }
 
-// receive function receives all incomming packets
-func (c *HttpClient) receive() {
-	buffer := make([]byte, UDPBufferSize)
-
-	for {
-		n, _, err := c.clientConn.ReadFromUDP(buffer)
-		if err != nil {
-			c.logger.Println(err)
-		}
-		p, err := lib.ParsePacket(buffer[:n])
-		if err != nil {
-			c.logger.Println(err)
-		}
-		// Response to handshake
-		if p.Type == lib.SYNACK {
-			c.clientConn.WriteToUDP(lib.Packet{Type: lib.ACK, SeqNum: p.SeqNum, ToAddr: c.serverAddr}.Raw(), c.routerAddr)
-			if len(handshakeSYNACKChannel) == 0 {
-				handshakeSYNACKChannel <- p
-			}
-		}
-		// ACK
-		if p.Type == lib.ACK {
-			if len(c.senderWindow[p.SeqNum].Ack) == 0 {
-				c.senderWindow[p.SeqNum].Timer.Stop()
-				c.senderWindow[p.SeqNum].Ack <- p
-				c.logger.Printf("[debug] ack from %s, packet %s\n", p.FromAddr, p)
-			}
-		}
-		// DATA
-		if p.Type == lib.DATA && c.senderWindow[p.SeqNum].Packet != nil {
-			c.senderWindow[p.SeqNum].Packet = p
-		}
-	}
-}
-
-func (c *HttpClient) send(u *url.URL, req []byte) (*http.Response, []byte) {
-	// send req in packets
+// send synchronous for req as packets and block until all packets being acknowledged
+func (c *HttpClient) send(u *url.URL, req []byte) []byte {
+	// send req as packets
 	startByte := 0
 	for startByte < len(req) {
 		var payload []byte
@@ -229,11 +296,14 @@ func (c *HttpClient) send(u *url.URL, req []byte) (*http.Response, []byte) {
 	}
 	// send delivery notice
 	c.sendPacket(&lib.Packet{Type: lib.DELIVER, SeqNum: c.seqNum, ToAddr: c.serverAddr})
+	c.logger.Println("[send] all response packets sent, wait for response...")
 
 	// wait for response and parse
 	<-c.deliveryMessage
+	// get response
+	rawResp := c.getPackets()
 
-	return nil, nil
+	return rawResp
 }
 
 // sendPacket create new element in sender window and send packet
@@ -247,101 +317,77 @@ func (c *HttpClient) sendPacket(packet *lib.Packet) {
 	c.seqNum++
 }
 
-func (c *HttpClient) get(inputUrl string, headers httpHeaderFlags, output string) *http.Response {
-	u, err := url.Parse(inputUrl)
+func (c *HttpClient) validateUrl(inputUrl string) bool {
+	_, err := url.ParseRequestURI(inputUrl)
 	if err != nil {
-		c.logger.Fatalf("[get][error] %s\n", err)
+		c.logger.Fatalf("[validateUrl][error] %s\n", err)
 	}
 
-	req := "GET " + inputUrl + " " + c.proto + "\r\n" +
-		"Host: " + u.Host + "\r\n"
-	for _, header := range headers {
-		req += header + "\r\n"
-	}
-	req += HttpRequestHeaderEnd
-
-	httpRes, rawRes := c.send(u, []byte(req))
-
-	if httpRes.StatusCode == http.StatusOK {
-		if c.verbose {
-			fmt.Println(string(rawRes))
-		} else {
-			bodyBytes, err := io.ReadAll(httpRes.Body)
-			if err != nil {
-				c.logger.Fatalf("[get][error] %s\n", err)
-			}
-			bodyString := string(bodyBytes)
-			if output != "" {
-				err := os.WriteFile(output, bodyBytes, 0644)
-				if err != nil {
-					c.logger.Fatalf("[get][error] %s\n", err)
-				}
-			} else {
-				fmt.Println(bodyString)
-			}
-		}
-	} else if httpRes.StatusCode == http.StatusMovedPermanently || httpRes.StatusCode == http.StatusFound {
-		redirectUrl := httpRes.Header.Get("Location")
-		if redirectUrl != "" {
-			c.logger.Printf("redirect to %s\n", redirectUrl)
-			c.get(redirectUrl, nil, output)
-		} else {
-			c.logger.Printf("redirct error: missing Location in header: %s\n", httpRes.Header)
-		}
-	} else {
-		c.logger.Println(string(rawRes))
-	}
-
-	return httpRes
+	return true
 }
 
-func (c *HttpClient) post(inputUrl string, headers httpHeaderFlags, data string, output string) *http.Response {
-	u, err := url.Parse(inputUrl)
-	if err != nil {
-		c.logger.Fatalf("[post][error] %s\n", err)
-	}
-
-	req := "POST " + inputUrl + " " + c.proto + "\r\n" +
-		"Host: " + u.Host + "\r\n"
-
-	for _, header := range headers {
-		req += header + "\r\n"
-	}
-	req += "Content-Length: " + strconv.Itoa(len(data)) + HttpRequestHeaderEnd + data
-
-	httpRes, rawRes := c.send(u, []byte(req))
-
+// processHttpResponse writes to file or write to logger
+func (c *HttpClient) processHttpResponse(httpRes *http.Response, rawRes []byte, responseLog string) {
 	if httpRes.StatusCode == http.StatusOK {
-		if c.verbose {
-			fmt.Println(string(rawRes))
-		} else {
-			bodyBytes, err := io.ReadAll(httpRes.Body)
-			if err != nil {
-				c.logger.Fatalf("[post][error] %s\n", err)
-			}
-			bodyString := string(bodyBytes)
-			if output != "" {
-				err := os.WriteFile(output, bodyBytes, 0644)
-				if err != nil {
-					c.logger.Fatalf("[post][error] %s\n", err)
-				}
-			} else {
-				fmt.Println(bodyString)
-			}
+		// parse response body
+		bodyBytes, err := io.ReadAll(httpRes.Body)
+		if err != nil {
+			c.logger.Fatalf("[paresHttpResponse][error] %s\n", err)
 		}
-	} else if httpRes.StatusCode == http.StatusMovedPermanently || httpRes.StatusCode == http.StatusFound {
-		redirectUrl := httpRes.Header.Get("Location")
-		if redirectUrl != "" {
-			c.logger.Printf("redirect to %s\n", redirectUrl)
-			c.post(redirectUrl, headers, data, output)
+		bodyString := string(bodyBytes)
+
+		// write to response file or write to logger
+		if responseLog != "" {
+			err := os.WriteFile(responseLog, bodyBytes, 0644)
+			if err != nil {
+				c.logger.Fatalf("[paresHttpResponse][error] %s\n", err)
+			}
 		} else {
-			c.logger.Printf("redirct error: missing Location in header: %s\n", httpRes.Header)
+			c.logger.Printf("[paresHttpResponse] %s\n", bodyString)
 		}
 	} else {
-		c.logger.Println(string(rawRes))
+		c.logger.Printf("[paresHttpResponse] %s\n", string(rawRes))
+	}
+}
+
+func (c *HttpClient) HandleGetRequest(url string, headers httpHeaderFlags, outputPath string) {
+	if c.validateUrl(url) {
+		if c.verbose {
+			c.logger.Println("[HandleGetRequest] received url: " + url)
+			c.logger.Println("[HandleGetRequest] received headers: " + headers.String())
+		}
+		httpRes, resRaw, err := c.get(url, headers)
+		if err != nil {
+			c.logger.Printf("[HandleGetRequest][error] response: %s, error: %s\n", resRaw, err)
+		} else {
+			c.processHttpResponse(httpRes, resRaw, outputPath)
+		}
+	} else {
+		c.logger.Printf("[HandleGetRequest][error] invalid request url: %s\n", url)
+	}
+}
+
+func (c *HttpClient) HandlePostRequest(url string, headers httpHeaderFlags, data string, inputFilePath string, outputPath string) {
+	if data != "" && inputFilePath != "" {
+		log.Fatal("cannot use [-d] and [-f] at same time")
 	}
 
-	return httpRes
+	if c.validateUrl(url) {
+		if c.verbose {
+			c.logger.Println("[HandlePostRequest] received url: " + url)
+			c.logger.Println("[HandlePostRequest] received headers: " + headers.String())
+		}
+
+		if data == "" && inputFilePath != "" {
+			data = loadDataFile(inputFilePath)
+		}
+		httpRes, resRaw, err := c.post(url, headers, data)
+		if err != nil {
+			c.logger.Printf("[HandlePostRequest][error] response: %s, error: %s\n", resRaw, err)
+		} else {
+			c.processHttpResponse(httpRes, resRaw, outputPath)
+		}
+	}
 }
 
 func contains(s []string, e string) bool {
@@ -413,8 +459,11 @@ func main() {
 	// Start receiving packets
 	go httpClient.receive()
 
-	// Start retransmission routinue
+	// Start retransmission routine
 	go httpClient.retransmission()
+
+	// Start delivery checking
+	go httpClient.checkForDeliver()
 
 	// Establish connection three-way handshake
 	httpClient.establishConnection()
@@ -442,12 +491,15 @@ func main() {
 
 		if word == "get" {
 			httpClient.HandleGetRequest(requestUrl, headers, *output)
-			os.Exit(1)
 		}
 
 		if word == "post" {
 			httpClient.HandlePostRequest(requestUrl, headers, *data, *file, *output)
-			os.Exit(1)
+		}
+
+		// block, in case any ack to server is lost and need resend
+		for {
+
 		}
 	}
 }
