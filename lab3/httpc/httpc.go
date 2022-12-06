@@ -221,9 +221,9 @@ func (c *HttpClient) post(inputUrl string, headers httpHeaderFlags, data string)
 
 // receive function receives all incomming packets
 func (c *HttpClient) receive() {
-	buffer := make([]byte, UDPBufferSize)
 
 	for {
+		buffer := make([]byte, UDPBufferSize)
 		n, _, err := c.clientConn.ReadFromUDP(buffer)
 		if err != nil {
 			c.logger.Println(err)
@@ -242,17 +242,17 @@ func (c *HttpClient) receive() {
 		}
 		// ACK
 		if p.Type == lib.ACK {
-			if len(c.senderWindow[p.SeqNum].Ack) == 0 {
+			if len(c.senderWindow[p.SeqNum].Ack) == 0 && c.senderWindow[p.SeqNum].Timer != nil {
 				c.senderWindow[p.SeqNum].Timer.Stop()
 				c.senderWindow[p.SeqNum].Ack <- p
-				c.logger.Printf("[receive] ack from %s, packet %s\n", p.FromAddr, p)
+				// c.logger.Printf("[receive] ack from %s, packet %s\n", p.FromAddr, p)
 			}
 		}
 		// DATA, DELIVER
 		if p.Type == lib.DATA || p.Type == lib.DELIVER {
 			// send ACK
 			c.clientConn.WriteToUDP(lib.Packet{Type: lib.ACK, SeqNum: p.SeqNum, ToAddr: p.FromAddr}.Raw(), c.routerAddr)
-			c.logger.Printf("[receive] ack to %s, packet %s\n", p.FromAddr, p)
+			// c.logger.Printf("[receive] ack to %s, packet %s\n", p.FromAddr, p)
 			// save packet in receiver window
 			if c.receiverWindow[p.SeqNum] == nil {
 				c.receiverWindow[p.SeqNum] = p
@@ -268,6 +268,8 @@ func (c *HttpClient) retransmission() {
 			if c.senderWindow[i] != nil && c.senderWindow[i].Packet != nil && len(c.senderWindow[i].Ack) == 0 && len(c.senderWindow[i].Timer.C) != 0 {
 				// resend
 				_, err := c.clientConn.WriteToUDP(c.senderWindow[i].Packet.Raw(), c.routerAddr)
+				c.logger.Printf("[retransmission][timeout] to %s, packet %s\n", c.senderWindow[i].Packet.ToAddr, c.senderWindow[i].Packet)
+
 				if err != nil {
 					c.logger.Printf("[retransmission][error] %s\n", err)
 				}
@@ -302,6 +304,7 @@ func (c *HttpClient) send(u *url.URL, req []byte) []byte {
 	<-c.deliveryMessage
 	// get response
 	rawResp := c.getPackets()
+	c.logger.Printf("[deliver_packets] deliver combined packets: %s\n", string(rawResp))
 
 	return rawResp
 }

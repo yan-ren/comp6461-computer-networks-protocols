@@ -25,7 +25,6 @@ const (
 	BufferSize           = 2048
 	CRLF                 = "\r\n"
 	HttpRequestHeaderEnd = "\r\n\r\n"
-	ReadTimeoutDuration  = 5 * time.Second
 	Host                 = "127.0.0.1"
 	WindowSize           = 1024
 	DefaultTimeOut       = 1 * time.Second
@@ -164,9 +163,9 @@ func (s *HttpServer) isConnected() bool {
 
 // receive function receives all incomming packets
 func (s *HttpServer) receive() {
-	buffer := make([]byte, BufferSize)
 
 	for {
+		buffer := make([]byte, BufferSize)
 		n, _, err := s.serverConn.ReadFromUDP(buffer)
 		if err != nil {
 			s.logger.Println(err)
@@ -188,17 +187,17 @@ func (s *HttpServer) receive() {
 		}
 		// ACK
 		if p.Type == lib.ACK && p.SeqNum != 0 {
-			if len(s.senderWindow[p.SeqNum].Ack) == 0 {
+			if s.senderWindow[p.SeqNum] != nil && len(s.senderWindow[p.SeqNum].Ack) == 0 && s.senderWindow[p.SeqNum].Timer != nil {
 				s.senderWindow[p.SeqNum].Timer.Stop()
 				s.senderWindow[p.SeqNum].Ack <- p
-				s.logger.Printf("[receive] ack from %s, packet %s\n", p.FromAddr, p)
+				// s.logger.Printf("[receive] ack from %s, packet %s\n", p.FromAddr, p)
 			}
 		}
 		// DATA, DELIVER
 		if p.Type == lib.DATA || p.Type == lib.DELIVER {
 			// send ACK
 			s.serverConn.WriteToUDP(lib.Packet{Type: lib.ACK, SeqNum: p.SeqNum, ToAddr: p.FromAddr}.Raw(), s.routerAddr)
-			s.logger.Printf("[receive] ack to %s, packet: %s\n", p.FromAddr, p)
+			// s.logger.Printf("[receive] ack to %s, packet: %s\n", p.FromAddr, p)
 			// save packet in receiver window
 			if s.receiverWindow[p.SeqNum] == nil {
 				s.receiverWindow[p.SeqNum] = p
@@ -226,6 +225,7 @@ func (s *HttpServer) retransmission() {
 				if s.senderWindow[i] != nil && s.senderWindow[i].Packet != nil && len(s.senderWindow[i].Ack) == 0 && len(s.senderWindow[i].Timer.C) != 0 {
 					// resend
 					_, err := s.serverConn.WriteToUDP(s.senderWindow[i].Packet.Raw(), s.routerAddr)
+					s.logger.Printf("[retransmission][timeout] to %s, packet %s\n", s.senderWindow[i].Packet.ToAddr, s.senderWindow[i].Packet)
 					if err != nil {
 						s.logger.Printf("[retransmission][error] %s\n", err)
 					}

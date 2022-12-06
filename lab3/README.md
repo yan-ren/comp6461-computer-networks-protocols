@@ -69,3 +69,13 @@
 ```
 ./httpc post -v -h Content-Type:application/json --d '{"Assignment": 100}' 'http://127.0.0.1:8007/../cool'
 ```
+
+#### Start router
+```
+./router --port=3000 --drop-rate=0.2 --max-delay=2s --seed=1
+```
+
+#### Post long data
+```
+./httpc post -h Content-Type:application/json --f ./sample2.txt "http://127.0.0.1:8007/sample2.txt"
+```
