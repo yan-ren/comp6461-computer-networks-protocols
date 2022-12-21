@@ -1,5 +1,10 @@
+# COMP6461 Computer Networks Protocols
+
+COMP6461 Computer Networks Protocols Fall2022 course labs implemented in Go.
+
 ## Usage Examples
 
+## Lab 1
 #### General
 ```
 ./httpc help
@@ -69,7 +74,7 @@
 ```
 ./httpc post -v -h Content-Type:application/json --d '{"Assignment": 100}' 'http://127.0.0.1:8007/../cool'
 ```
-
+## Lab 3
 #### Start router
 ```
 ./router --port=3000 --drop-rate=0.2 --max-delay=2s --seed=1
